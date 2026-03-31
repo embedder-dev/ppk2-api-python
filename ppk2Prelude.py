@@ -140,6 +140,7 @@ def ppk2_measure(duration_ms=1000, source_voltage_mv=None, port=None,
             if _ppk2_connections[p] is ppk2:
                 actual_port = p
                 break
+    powered_on = False
     if source_voltage_mv is not None:
         mv = int(source_voltage_mv)
         if mv < 800 or mv > 5000:
@@ -147,21 +148,24 @@ def ppk2_measure(duration_ms=1000, source_voltage_mv=None, port=None,
         ppk2.use_source_meter()
         ppk2.set_source_voltage(mv)
         ppk2.toggle_DUT_power("ON")
+        powered_on = True
         time.sleep(float(settle_ms) / 1000.0)
-    ppk2.start_measuring()
-    duration_s = float(duration_ms) / 1000.0
-    all_samples = []
-    end_time = time.time() + duration_s
-    while time.time() < end_time:
-        read_data = ppk2.get_data()
-        if read_data is not None:
-            samples, raw_digital = ppk2.get_samples(read_data)
-            if samples is not None:
-                all_samples.extend(samples)
-        time.sleep(float(sample_interval_ms) / 1000.0)
-    ppk2.stop_measuring()
-    if source_voltage_mv is not None:
-        ppk2.toggle_DUT_power("OFF")
+    try:
+        ppk2.start_measuring()
+        duration_s = float(duration_ms) / 1000.0
+        all_samples = []
+        end_time = time.time() + duration_s
+        while time.time() < end_time:
+            read_data = ppk2.get_data()
+            if read_data is not None:
+                samples, raw_digital = ppk2.get_samples(read_data)
+                if samples is not None:
+                    all_samples.extend(samples)
+            time.sleep(float(sample_interval_ms) / 1000.0)
+    finally:
+        ppk2.stop_measuring()
+        if powered_on:
+            ppk2.toggle_DUT_power("OFF")
     if not all_samples:
         return {
             "success": False,
@@ -192,6 +196,10 @@ def _ppk2_cleanup():
     for _ppk2_port, _ppk2_dev in list(_ppk2_connections.items()):
         try:
             _ppk2_dev.stop_measuring()
+        except Exception:
+            pass
+        try:
+            _ppk2_dev.toggle_DUT_power("OFF")
         except Exception:
             pass
     _ppk2_connections.clear()
