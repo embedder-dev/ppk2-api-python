@@ -150,6 +150,8 @@ def ppk2_measure(duration_ms=1000, source_voltage_mv=None, port=None,
         ppk2.toggle_DUT_power("ON")
         powered_on = True
         time.sleep(float(settle_ms) / 1000.0)
+    else:
+        ppk2.use_ampere_meter()
     try:
         ppk2.start_measuring()
         duration_s = float(duration_ms) / 1000.0
