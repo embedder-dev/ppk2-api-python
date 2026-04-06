@@ -194,6 +194,23 @@ def ppk2_measure(duration_ms=1000, source_voltage_mv=None, port=None,
         result["samples_ua"] = [round(s, 3) for s in all_samples]
     return result
 
+def ppk2_print_result(success, summary, data=None, metadata=None):
+    payload = {"success": bool(success), "summary": str(summary)}
+    if data is not None:
+        payload["data"] = data
+    if metadata is not None:
+        payload["metadata"] = metadata
+    print(json.dumps(payload))
+
+def ppk2_print_measure(duration_ms=1000, source_voltage_mv=None, **kwargs):
+    result = ppk2_measure(duration_ms=duration_ms, source_voltage_mv=source_voltage_mv, **kwargs)
+    ppk2_print_result(result["success"], result["summary"], data=result)
+    return result
+
+def ppk2_fail(summary, data=None, metadata=None):
+    ppk2_print_result(False, summary, data=data, metadata=metadata)
+    raise RuntimeError(summary)
+
 def _ppk2_cleanup():
     for _ppk2_port, _ppk2_dev in list(_ppk2_connections.items()):
         try:
