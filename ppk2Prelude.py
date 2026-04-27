@@ -275,10 +275,10 @@ def ppk2_publish_capture(name=None):
         "sample_count": len(samples),
         "digital_channels": [],
         "analog_channels": [{"name": "current_ua", "index": 0}],
-        "analog_csv_dir": tmpdir,
-        "sal_path": None,
         "analyzers": [],
     }
+    if tmpdir is not None:
+        payload["analog_csv_dir"] = tmpdir
     _ppk2_bridge_publish_capture(payload)
     state["published"] = True
     return payload["capture_id"]
