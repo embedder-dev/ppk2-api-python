@@ -8,12 +8,27 @@
 # You may redistribute and/or modify it under the terms of the GPL v2.
 # See https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
 
+import atexit
+import csv
 import json
+import os
+import sys
+import tempfile
 import time
+import uuid
 
 from ppk2_api.ppk2_api import PPK2_MP
 
+_PPK2_SAMPLE_RATE_HZ = 100_000
+
 _ppk2_connections = {}
+
+_ppk2_capture_state = {
+    "samples": None,
+    "sample_rate": None,
+    "started_at": None,
+    "published": False,
+}
 
 def ppk2_list_devices():
     raw = PPK2_MP.list_devices()
@@ -74,6 +89,12 @@ def ppk2_power_off_dut(port=None):
 def ppk2_start_measuring(port=None):
     ppk2 = ppk2_connect(port)
     ppk2.start_measuring()
+    _ppk2_capture_state.update({
+        "samples": [],
+        "sample_rate": _PPK2_SAMPLE_RATE_HZ,
+        "started_at": time.monotonic(),
+        "published": False,
+    })
     return {"success": True, "measuring": True}
 
 def ppk2_read_samples(duration_ms=1000, port=None, include_digital=False):
@@ -87,6 +108,8 @@ def ppk2_read_samples(duration_ms=1000, port=None, include_digital=False):
             samples, raw_digital = ppk2.get_samples(read_data)
             if samples is not None:
                 all_samples.extend(samples)
+                if _ppk2_capture_state["samples"] is not None:
+                    _ppk2_capture_state["samples"].extend(samples)
         time.sleep(0.001)
     if not all_samples:
         return {"success": False, "summary": "No samples collected", "sample_count": 0}
@@ -110,6 +133,13 @@ def ppk2_read_samples(duration_ms=1000, port=None, include_digital=False):
 def ppk2_stop_measuring(port=None):
     ppk2 = ppk2_connect(port)
     ppk2.stop_measuring()
+    try:
+        ppk2_publish_capture()
+    finally:
+        _ppk2_capture_state["samples"] = None
+        _ppk2_capture_state["sample_rate"] = None
+        _ppk2_capture_state["started_at"] = None
+        _ppk2_capture_state["published"] = False
     return {"success": True, "measuring": False}
 
 def ppk2_disconnect(port=None):
@@ -152,6 +182,12 @@ def ppk2_measure(duration_ms=1000, source_voltage_mv=None, port=None,
         time.sleep(float(settle_ms) / 1000.0)
     else:
         ppk2.use_ampere_meter()
+    _ppk2_capture_state.update({
+        "samples": [],
+        "sample_rate": _PPK2_SAMPLE_RATE_HZ,
+        "started_at": time.monotonic(),
+        "published": False,
+    })
     try:
         ppk2.start_measuring()
         duration_s = float(duration_ms) / 1000.0
@@ -163,11 +199,20 @@ def ppk2_measure(duration_ms=1000, source_voltage_mv=None, port=None,
                 samples, raw_digital = ppk2.get_samples(read_data)
                 if samples is not None:
                     all_samples.extend(samples)
+                    if _ppk2_capture_state["samples"] is not None:
+                        _ppk2_capture_state["samples"].extend(samples)
             time.sleep(float(sample_interval_ms) / 1000.0)
     finally:
         ppk2.stop_measuring()
         if powered_on:
             ppk2.toggle_DUT_power("OFF")
+        try:
+            ppk2_publish_capture(name=f"PPK2 measure {duration_ms}ms")
+        finally:
+            _ppk2_capture_state["samples"] = None
+            _ppk2_capture_state["sample_rate"] = None
+            _ppk2_capture_state["started_at"] = None
+            _ppk2_capture_state["published"] = False
     if not all_samples:
         return {
             "success": False,
@@ -194,7 +239,55 @@ def ppk2_measure(duration_ms=1000, source_voltage_mv=None, port=None,
         result["samples_ua"] = [round(s, 3) for s in all_samples]
     return result
 
+def _ppk2_bridge_publish_capture(payload):
+    try:
+        _hardware_bridge_request({"cmd": "capture_published", "payload": payload})
+    except NameError:
+        return
+    except Exception as exc:
+        sys.stderr.write(f"[embedder] ppk2 capture_published failed: {exc}\n")
+        sys.stderr.flush()
+
+def _ppk2_write_analog_csv(samples, sample_rate):
+    tmpdir = tempfile.mkdtemp(prefix="embedder_ppk2_")
+    path = os.path.join(tmpdir, "analog.csv")
+    dt = 1.0 / sample_rate if sample_rate else 0.0
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["time_sec", "current_ua"])
+        for i, v in enumerate(samples):
+            w.writerow([f"{i * dt:.9f}", f"{v:.6f}"])
+    return tmpdir
+
+def ppk2_publish_capture(name=None):
+    state = _ppk2_capture_state
+    if state["samples"] is None or state["published"]:
+        return None
+    samples = state["samples"]
+    sample_rate = state["sample_rate"] or 0
+    duration = (len(samples) / sample_rate) if sample_rate else 0.0
+    tmpdir = _ppk2_write_analog_csv(samples, sample_rate) if samples else None
+    payload = {
+        "capture_id": uuid.uuid4().hex,
+        "name": name or f"PPK2 {time.strftime('%H:%M:%S')}",
+        "sample_rate": int(sample_rate),
+        "duration_sec": float(duration),
+        "sample_count": len(samples),
+        "digital_channels": [],
+        "analog_channels": [{"name": "current_ua", "index": 0}],
+        "analog_csv_dir": tmpdir,
+        "sal_path": None,
+        "analyzers": [],
+    }
+    _ppk2_bridge_publish_capture(payload)
+    state["published"] = True
+    return payload["capture_id"]
+
 def _ppk2_cleanup():
+    try:
+        ppk2_publish_capture()
+    except Exception:
+        pass
     for _ppk2_port, _ppk2_dev in list(_ppk2_connections.items()):
         try:
             _ppk2_dev.stop_measuring()
@@ -205,3 +298,5 @@ def _ppk2_cleanup():
         except Exception:
             pass
     _ppk2_connections.clear()
+
+atexit.register(_ppk2_cleanup)
