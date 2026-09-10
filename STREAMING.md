@@ -10,9 +10,15 @@ The SDK remains `ppk2-api==0.9.2`; no upstream driver modification is required.
   Its successful output setting persists after the helper returns.
 
 Profile fields: `stream_id`, `port` or `serial_number`, `mode` (`ampere_meter` by
- default or `source_meter`), `source_voltage_mv` (required in source mode, integer
-800–5000), `dut_on` (default false), and `rate_hz` (1, 2, 5, 10, 20, 50 or 100;
+ default or `source_meter`), `source_voltage_mv` (required in source mode) or `input_voltage_mv` (required
+in ampere mode), both integer 800–5000 mV, `dut_on` (default false), and `rate_hz` (1, 2, 5, 10, 20, 50 or 100;
 default 2). With no device selector exactly one PPK2 must be attached.
+
+The PyPI SDK needs supply voltage for current calibration in both modes. In
+ampere mode the helper calls the public `set_source_voltage` API after selecting
+ampere mode, configuring the inactive regulator and calibration value without
+enabling source output. Use the actual external supply voltage. Device discovery
+normalizes both PyPI string paths and the fork's `(port, serial)` pairs.
 
 Callbacks return `control` (`run`, `pause`, `stop`) and optionally `dut` (`on`,
 `off`, source mode only). Stop takes precedence over any pending DUT command.

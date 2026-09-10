@@ -19,6 +19,7 @@ import time
 import uuid
 
 from ppk2_api.ppk2_api import PPK2_MP
+from serial.tools.list_ports import comports
 
 _PPK2_SAMPLE_RATE_HZ = 100_000
 
@@ -35,10 +36,16 @@ def ppk2_list_devices():
     raw = PPK2_MP.list_devices()
     if not raw:
         return []
+    ports = {entry.device: entry for entry in comports()}
     result = []
-    for d in raw:
-        port, sn, *_ = d
-        result.append({"port": port, "serial_number": sn})
+    for device in raw:
+        if isinstance(device, str):
+            port = device
+            info = ports.get(port)
+            serial_number = info.serial_number if info else None
+        else:
+            port, serial_number, *_ = device
+        result.append({"port": port, "serial_number": serial_number})
     return result
 
 def ppk2_connect(port=None, use_buffered_reader=True):
@@ -320,10 +327,10 @@ def _ppk2_stream_config(profile):
     mode = profile.get("mode", "ampere_meter")
     if mode not in ("source_meter", "ampere_meter"):
         raise ValueError("Unknown PPK2 measurement mode")
-    voltage = profile.get("source_voltage_mv")
-    if mode == "source_meter":
-        if isinstance(voltage, bool) or not isinstance(voltage, (int, float)) or not 800 <= voltage <= 5000 or int(voltage) != voltage:
-            raise ValueError("Source mode requires an integer voltage between 800 and 5000 mV")
+    voltage_key = "source_voltage_mv" if mode == "source_meter" else "input_voltage_mv"
+    voltage = profile.get(voltage_key)
+    if isinstance(voltage, bool) or not isinstance(voltage, (int, float)) or not 800 <= voltage <= 5000 or int(voltage) != voltage:
+        raise ValueError(f"{voltage_key} must be an integer between 800 and 5000 mV")
     if mode == "ampere_meter" and profile.get("dut_on"):
         raise ValueError("DUT power control requires source meter mode")
     return mode, voltage
@@ -395,6 +402,7 @@ def ppk2_stream(profile, on_batch):
             device.toggle_DUT_power("ON" if profile.get("dut_on") else "OFF")
         else:
             device.use_ampere_meter()
+            device.set_source_voltage(int(voltage))
         device.start_measuring()
         response = push([])
         while True:

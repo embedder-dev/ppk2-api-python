@@ -44,10 +44,12 @@ class FakeDevice:
 def load_bridge():
     sdk = types.ModuleType("ppk2_api.ppk2_api")
     sdk.PPK2_MP = FakeDevice
+    ports = types.ModuleType("serial.tools.list_ports")
+    ports.comports = lambda: [types.SimpleNamespace(device="/dev/ppk2", serial_number="ABC")]
     spec = importlib.util.spec_from_file_location(
         "test_ppk2_bridge", pathlib.Path(__file__).parents[1] / "ppk2Prelude.py")
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"ppk2_api": types.ModuleType("ppk2_api"), "ppk2_api.ppk2_api": sdk}):
+    with patch.dict(sys.modules, {"ppk2_api": types.ModuleType("ppk2_api"), "ppk2_api.ppk2_api": sdk, "serial.tools.list_ports": ports}):
         spec.loader.exec_module(module)
     return module
 
@@ -64,6 +66,12 @@ class StreamTests(unittest.TestCase):
         self.sleep.stop()
         self.bridge._ppk2_cleanup()
         self.bridge.atexit.unregister(self.bridge._ppk2_cleanup)
+
+    def test_pypi_device_paths_and_fork_device_tuples(self):
+        for devices in [["/dev/ppk2"], [("/dev/ppk2", "ABC")]]:
+            FakeDevice.devices = devices
+            self.assertEqual(self.bridge.ppk2_list_devices(), [{"port": "/dev/ppk2", "serial_number": "ABC"}])
+            self.assertEqual(self.bridge._ppk2_stream_port({"serial_number": "ABC"}), "/dev/ppk2")
 
     def test_window_units_extrema_charge_and_bounded_state(self):
         stats = self.bridge._PPK2Statistics(100)
@@ -87,11 +95,11 @@ class StreamTests(unittest.TestCase):
         def on_batch(payload):
             batches.append(payload)
             return {"control": next(replies)}
-        result = self.bridge.ppk2_stream({"rate_hz": 100}, on_batch)
+        result = self.bridge.ppk2_stream({"input_voltage_mv": 3300, "rate_hz": 100}, on_batch)
         self.assertEqual([len(b["samples"]) for b in batches], [0, 1, 0, 0, 0, 1])
         self.assertEqual(result["windows"], 2)
         self.assertEqual(self.device.get_data.call_count, 5)
-        self.assertEqual(self.device.commands, ["ampere", "start", "stop"])
+        self.assertEqual(self.device.commands, ["ampere", 3300, "start", "stop"])
         self.assertEqual(self.bridge._ppk2_connections, {})
         self.assertIsNone(self.bridge._ppk2_capture_state["samples"])
 
@@ -116,21 +124,21 @@ class StreamTests(unittest.TestCase):
         self.device.get_data.return_value = b""
         with patch.object(self.bridge.time, "monotonic", side_effect=[0.0, 6.0]):
             with self.assertRaisesRegex(RuntimeError, "stopped delivering"):
-                self.bridge.ppk2_stream({}, lambda _: {})
+                self.bridge.ppk2_stream({"input_voltage_mv": 3300}, lambda _: {})
         self.assertEqual(self.device.commands[-1], "stop")
 
     def test_invalid_configuration_never_starts_hardware(self):
-        for profile in [{"rate_hz": 10000}, {"mode": "source_meter"}, {"mode": "source_meter", "source_voltage_mv": 6000}, {"dut_on": True}, {"mode": "invalid"}]:
+        for profile in [{"input_voltage_mv": None}, {"input_voltage_mv": 6000}, {"rate_hz": 10000}, {"mode": "source_meter"}, {"mode": "source_meter", "source_voltage_mv": 6000}, {"dut_on": True}, {"mode": "invalid"}]:
             with self.subTest(profile=profile), self.assertRaises(ValueError):
-                self.bridge.ppk2_stream(profile, Mock())
+                self.bridge.ppk2_stream({"input_voltage_mv": 3300, **profile}, Mock())
         self.assertEqual(self.device.commands, [])
 
     def test_ambiguous_device_requires_selection(self):
         FakeDevice.devices.append(("/dev/other", "DEF"))
         with self.assertRaisesRegex(ValueError, "exactly one"):
-            self.bridge.ppk2_stream({}, Mock())
-        self.bridge.ppk2_stream({"serial_number": "ABC"}, lambda _: {"control": "stop"})
-        self.assertEqual(self.device.commands, ["ampere", "start", "stop"])
+            self.bridge.ppk2_stream({"input_voltage_mv": 3300}, Mock())
+        self.bridge.ppk2_stream({"serial_number": "ABC", "input_voltage_mv": 3300}, lambda _: {"control": "stop"})
+        self.assertEqual(self.device.commands, ["ampere", 3300, "start", "stop"])
 
     def test_idle_dut_keeps_output_and_does_not_auto_publish(self):
         result = self.bridge.ppk2_dut({"mode": "source_meter", "source_voltage_mv": 3300, "dut_on": True})
@@ -143,7 +151,7 @@ class StreamTests(unittest.TestCase):
         session = Mock()
         session.request.return_value = {"control": "stop"}
         with patch.object(self.bridge, "_HardwareBridgeSession", return_value=session, create=True):
-            self.bridge.ppk2_live({"stream_id": "test-stream"})
+            self.bridge.ppk2_live({"stream_id": "test-stream", "input_voltage_mv": 3300})
         self.assertEqual(session.request.call_args.args[0]["cmd"], "power_live")
         self.assertEqual(session.request.call_args.args[0]["payload"]["stream_id"], "test-stream")
         session.close.assert_called_once()
