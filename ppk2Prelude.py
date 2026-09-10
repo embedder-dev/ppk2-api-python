@@ -11,6 +11,7 @@
 import atexit
 import csv
 import json
+import math
 import os
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import time
 import uuid
 
 from ppk2_api.ppk2_api import PPK2_MP
+from serial.tools.list_ports import comports
 
 _PPK2_SAMPLE_RATE_HZ = 100_000
 
@@ -34,10 +36,16 @@ def ppk2_list_devices():
     raw = PPK2_MP.list_devices()
     if not raw:
         return []
+    ports = {entry.device: entry for entry in comports()}
     result = []
-    for d in raw:
-        port, sn, *_ = d
-        result.append({"port": port, "serial_number": sn})
+    for device in raw:
+        if isinstance(device, str):
+            port = device
+            info = ports.get(port)
+            serial_number = info.serial_number if info else None
+        else:
+            port, serial_number, *_ = device
+        result.append({"port": port, "serial_number": serial_number})
     return result
 
 def ppk2_connect(port=None, use_buffered_reader=True):
@@ -300,3 +308,171 @@ def _ppk2_cleanup():
     _ppk2_connections.clear()
 
 atexit.register(_ppk2_cleanup)
+
+_PPK2_STREAM_RATES_HZ = (1, 2, 5, 10, 20, 50, 100)
+
+
+def _ppk2_stream_port(profile):
+    devices = ppk2_list_devices()
+    port = profile.get("port")
+    serial = profile.get("serial_number")
+    matches = [d for d in devices if (not port or d["port"] == port)
+               and (not serial or d["serial_number"] == serial)]
+    if len(matches) != 1:
+        raise ValueError("Select exactly one connected PPK2 by port or serial number")
+    return matches[0]["port"]
+
+
+def _ppk2_stream_config(profile):
+    mode = profile.get("mode", "ampere_meter")
+    if mode not in ("source_meter", "ampere_meter"):
+        raise ValueError("Unknown PPK2 measurement mode")
+    voltage_key = "source_voltage_mv" if mode == "source_meter" else "input_voltage_mv"
+    voltage = profile.get(voltage_key)
+    if isinstance(voltage, bool) or not isinstance(voltage, (int, float)) or not 800 <= voltage <= 5000 or int(voltage) != voltage:
+        raise ValueError(f"{voltage_key} must be an integer between 800 and 5000 mV")
+    if mode == "ampere_meter" and profile.get("dut_on"):
+        raise ValueError("DUT power control requires source meter mode")
+    return mode, voltage
+
+
+class _PPK2Statistics:
+    def __init__(self, rate_hz):
+        self.window_size = _PPK2_SAMPLE_RATE_HZ // rate_hz
+        self.rate_hz = rate_hz
+        self.emitted = 0
+        self.charge_c = 0.0
+        self.discard()
+
+    def discard(self):
+        self.count = 0
+        self.total = 0.0
+        self.minimum = float("inf")
+        self.maximum = float("-inf")
+
+    def consume(self, samples):
+        windows = []
+        for current_ua in samples:
+            current_a = float(current_ua) * 1e-6
+            if not math.isfinite(current_a):
+                raise ValueError("PPK2 returned a non-finite current sample")
+            self.count += 1
+            self.total += current_a
+            self.minimum = min(self.minimum, current_a)
+            self.maximum = max(self.maximum, current_a)
+            if self.count == self.window_size:
+                self.charge_c += self.total / _PPK2_SAMPLE_RATE_HZ
+                windows.append({
+                    "t": self.emitted / self.rate_hz,
+                    "current_a": self.total / self.count,
+                    "min_current_a": self.minimum,
+                    "max_current_a": self.maximum,
+                    "charge_c": self.charge_c,
+                    "voltage_v": None,
+                    "power_w": None,
+                    "energy_j": None,
+                })
+                self.emitted += 1
+                self.discard()
+        return windows
+
+
+def ppk2_stream(profile, on_batch):
+    mode, voltage = _ppk2_stream_config(profile)
+    rate_hz = profile.get("rate_hz", 2)
+    if isinstance(rate_hz, bool) or rate_hz not in _PPK2_STREAM_RATES_HZ:
+        raise ValueError("PPK2 statistics rate must be one of 1, 2, 5, 10, 20, 50, 100 Hz")
+    port = _ppk2_stream_port(profile)
+    device = ppk2_connect(port)
+    stats = _PPK2Statistics(int(rate_hz))
+    stream_id = str(profile.get("stream_id", ""))
+    previous_control = "run"
+    discard_next_batch = False
+    last_data = time.monotonic()
+
+    def push(samples):
+        return on_batch({"stream_id": stream_id, "device": port,
+                         "rate_hz": rate_hz, "samples": samples}) or {}
+
+    try:
+        if mode == "source_meter":
+            device.toggle_DUT_power("OFF")
+            device.use_source_meter()
+            device.set_source_voltage(int(voltage))
+            device.toggle_DUT_power("ON" if profile.get("dut_on") else "OFF")
+        else:
+            device.use_ampere_meter()
+            device.set_source_voltage(int(voltage))
+        device.start_measuring()
+        response = push([])
+        while True:
+            control = response.get("control", "run")
+            if control == "stop":
+                break
+            if control not in ("run", "pause"):
+                raise ValueError("Unknown PPK2 stream control")
+            if previous_control == "pause" and control == "run":
+                discard_next_batch = True
+            previous_control = control
+            dut = response.get("dut")
+            if dut is not None:
+                if mode != "source_meter" or dut not in ("on", "off"):
+                    raise ValueError("Invalid PPK2 DUT power command")
+                device.toggle_DUT_power(dut.upper())
+            raw = device.get_data()
+            windows = []
+            if raw:
+                samples, _ = device.get_samples(raw)
+                if samples:
+                    last_data = time.monotonic()
+                    if control == "run" and not discard_next_batch:
+                        windows = stats.consume(samples)
+                    discard_next_batch = False
+            if control == "pause":
+                stats.discard()
+            if time.monotonic() - last_data > 5.0:
+                raise RuntimeError("PPK2 stopped delivering samples; check the USB connection")
+            response = push(windows)
+            time.sleep(0.05)
+    finally:
+        try:
+            device.stop_measuring()
+        finally:
+            try:
+                if mode == "source_meter":
+                    device.toggle_DUT_power("OFF")
+            finally:
+                _ppk2_connections.pop(port, None)
+    return {"success": True, "summary": "PPK2 stream stopped",
+            "windows": stats.emitted, "rate_hz": rate_hz}
+
+
+def ppk2_live(profile):
+    bridge = _HardwareBridgeSession(timeout=5.0)
+    try:
+        return ppk2_stream(profile, lambda payload: bridge.request(
+            {"cmd": "power_live", "payload": payload}))
+    finally:
+        bridge.close()
+
+
+def ppk2_dut(profile):
+    mode, voltage = _ppk2_stream_config(profile)
+    if mode != "source_meter":
+        raise ValueError("DUT power control requires source meter mode")
+    port = _ppk2_stream_port(profile)
+    device = ppk2_connect(port)
+    try:
+        device.toggle_DUT_power("OFF")
+        device.use_source_meter()
+        device.set_source_voltage(int(voltage))
+        device.toggle_DUT_power("ON" if profile.get("dut_on") else "OFF")
+    except BaseException:
+        device.toggle_DUT_power("OFF")
+        raise
+    finally:
+        try:
+            device.stop_measuring()
+        finally:
+            _ppk2_connections.pop(port, None)
+    return {"success": True, "on": bool(profile.get("dut_on"))}
